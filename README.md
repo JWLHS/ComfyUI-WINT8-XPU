@@ -1,11 +1,7 @@
 ```markdown
 # WINT8 — Per-Row INT8 量化插件 for ComfyUI (Intel Arc XPU)
 
-> **Per-row INT8 model quantization & loading for ComfyUI on Intel Arc A770 / B580.**
-
-[![ComfyUI](https://img.shields.io/badge/ComfyUI-0.26%2B-green)](https://github.com/comfyanonymous/ComfyUI)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.12.0%2Bxpu-orange)](https://pytorch.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+> Per-row INT8 model quantization & loading for ComfyUI on Intel Arc A770 / B580.
 
 ---
 
@@ -45,7 +41,7 @@
 
 ```
 量化阶段（离线）：             推理阶段（在线）：
-                                
+
 weight_fp16 (out, in)         safetensors 加载
     │                             │
     ▼                             ▼
@@ -145,9 +141,7 @@ safetensors         # 模型文件读写
 
 #### FP8 → INT8 转换
 
-如果输入模型是 FP8（`Float8_e4m3fn`），内置量化会自动转为 float32 再量化，输出 INT8。
-
-> 文件体积变化极小（仅增加 per-row scale，约 0.1%）。目的不是省体积，而是用 per-row scale 替代 FP8 的全局 scale 提升质量。
+如果输入模型是 FP8（`Float8_e4m3fn`），内置量化会自动转为 float32 再量化，输出 INT8。文件体积变化极小（仅增加 per-row scale，约 0.1%）。目的不是省体积，而是用 per-row scale 替代 FP8 的全局 scale 提升质量。
 
 ---
 
@@ -205,7 +199,7 @@ Int8XPUOps.Linear._load_from_state_dict:
 |---|---|---|---|
 | **格式** | per-row INT8 | per-row INT8 | per-row INT8 |
 | **舍入方式** | Learned rounding | 简单 round | 简单 round + Hadamard |
-| **质量** | ⭐⭐⭐ 最高 | ⭐⭐ 良好 | ⭐⭐⭐ 优秀 |
+| **质量** | 最高 | 良好 | 优秀 |
 | **依赖** | `convert-to-quant` | 无 | 无（scipy 可选） |
 | **模型兼容** | 部分模型有 bug（见 FAQ） | 全部 | 全部（需 in_f 整除 group_size） |
 | **推理速度** | 一致 | 一致 | 略有 overhead（Hadamard 旋转） |
@@ -431,14 +425,3 @@ MIT © 2026 JWLHS
 
 ---
 
-**改动 vs 上一版：**
-
-- 补上了实际仓库地址 `https://github.com/JWLHS/ComfyUI-WINT8-XPU`
-- 新增"常见问题"一节（lm_head 警告、FP8 报错、文件大小不变、AIMDO 泄漏等）
-- 量化参数表格补全了默认值
-- 新增量化速度参考
-- 新增 FP8→INT8 转换说明
-- 文件结构补上了 LICENSE 和 .gitignore
-- 补全了 license 信息
-
-直接覆盖 `README.md`，然后 `git add README.md && git commit -m "update README" && git push`。
