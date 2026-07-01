@@ -47,7 +47,7 @@ _EXCLUSIONS = {
     ],
     "wan": [
         "patch_embedding", "text_embedding", "time_embedding",
-        "time_projection", "head", "img_emb",
+        "time_projection", "head", "img_emb", "motion_encoder",
     ],
     "ltx2": [
         "adaln_single", "audio_adaln_single", "audio_caption_projection",
@@ -55,6 +55,7 @@ _EXCLUSIONS = {
         "av_ca_a2v_gate_adaln_single", "av_ca_audio_scale_shift_adaln_single",
         "av_ca_v2a_gate_adaln_single", "av_ca_video_scale_shift_adaln_single",
         "caption_projection", "patchify_proj", "proj_out", "scale_shift_table",
+        "learnable_registers", "q_norm", "k_norm",
     ],
     "qwen": [
         "time_text_embed", "img_in", "norm_out", "proj_out", "txt_in",
@@ -273,6 +274,12 @@ class WINT8ModelQuantizer:
 
         H = None
         quarot_applied = False
+
+        # Boogu: override group_size to 32 for full QuaRot coverage
+        if model_type == "boogu" and enable_quarot:
+            group_size = 32
+            log.info(f"[WINT8 Quantizer] Boogu detected: overriding group_size → 32 (full coverage)")
+
         if enable_quarot:
             H = build_hadamard(group_size, device=str(dev), dtype=torch.float32)
             log.info(f"[WINT8 Quantizer] QuaRot enabled, group_size={group_size}")

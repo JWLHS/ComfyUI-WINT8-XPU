@@ -1,11 +1,11 @@
 """
 WINT8 Model Quantizer + Loader
-───────────────────────────────
+──────────────────────────────
 Standalone INT8 per-row model quantization & loading for ComfyUI.
 
-Two nodes:
-  WINT8ModelQuantizer  → offline per-row INT8 quantization
-  WINT8ModelLoader     → load INT8 models with VRAM savings
+Nodes:
+  WINT8ModelQuantizer  → UNet BF16/FP16/FP8 → INT8
+  WINT8ModelLoader     → load INT8 UNet
 
 Pure PyTorch — no CUDA, no external dependencies beyond ComfyUI itself.
 Works on CPU / CUDA / XPU / any PyTorch backend.

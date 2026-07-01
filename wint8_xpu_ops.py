@@ -194,6 +194,17 @@ if _COMFY_OPS:
                 input_scale_key = prefix + "input_scale"
 
                 weight_tensor = state_dict.pop(weight_key, None)
+
+                # Conv2d layers use "kernel" instead of "weight"
+                if weight_tensor is None:
+                    kernel_key = prefix + "kernel"
+                    weight_tensor = state_dict.pop(kernel_key, None)
+                    if weight_tensor is not None:
+                        weight_key = kernel_key
+                        scale_key = prefix + "kernel_scale"
+                        meta_key = prefix + "kernel_comfy_quant"
+                        input_scale_key = prefix + "kernel_input_scale"
+
                 weight_scale = state_dict.pop(scale_key, None)
                 meta_raw = state_dict.pop(meta_key, None)
                 state_dict.pop(input_scale_key, None)

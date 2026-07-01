@@ -1,4 +1,3 @@
-```markdown
 # WINT8 — Per-Row INT8 量化插件 for ComfyUI (Intel Arc XPU)
 
 > Per-row INT8 model quantization & loading for ComfyUI on Intel Arc A770 / B580.
@@ -21,6 +20,9 @@
 10. [已验证效果](#已验证效果)
 11. [Bug 修复记录](#bug-修复记录)
 12. [文件结构](#文件结构)
+13. [v5.1 同步更新](#v51-同步更新-2026-07-02)
+14. [关于 ComfyUI 原生加载器](#关于-comfyui-原生加载器)
+15. [关于性能](#关于性能)
 
 ---
 
@@ -130,6 +132,7 @@ safetensors         # 模型文件读写
 - **仅在 `builtin` 模式下生效**（ctq 模式由 ctq 自己的 `--convrot` 控制）
 - `group_size` 必须是 **2 的幂**，且需整除权重的 `in_features`
 - 量化时旋转权重（离线），推理时旋转激活（在线）— 两处由插件自动处理
+- **Boogu 自动覆盖：** `model_type=="boogu"` 时自动强制 `group_size=32`，覆盖率 27%→100%
 
 #### 量化速度参考（A770 XPU）
 
@@ -330,6 +333,8 @@ WINT8 Model Loader → MODEL
 | 时间嵌入 | `time_in`, `t_embedder`, `time_projection` | 小参数，量化无益 |
 | Norm 层 | `adaLN`, `norm_out`, `norm_q`, `norm_k` | 非 2D 权重 |
 | 小 Embedding | `patch_embedding`, `text_embedding` | 参数量极小 |
+| 特殊注册层 | `learnable_registers`, `q_norm`, `k_norm` | 非标准 Linear，量化会坏 |
+| 视频编码器 | `motion_encoder` | 非 Transformer 层，保持原精度 |
 
 ---
 
@@ -357,6 +362,10 @@ WINT8 Model Loader → MODEL
 1. `enable_quarot = True`
 2. `quant_method = builtin`
 3. 权重的 `in_features` 能被 `group_size` 整除
+
+### Q: 原生 Load Diffusion Model 能加载 INT8 模型吗？
+
+**A:** 新版 ComfyUI 可以。核心 `ops.py` 已内置 `int8_tensorwise` 格式支持（含 `convrot`/QuaRot 协议）。如果你的 ComfyUI 版本较新，**优先尝试原生加载器**。遇到兼容性问题再切回 `WINT8 Model Loader`。本插件的量化器产生的格式与原生协议完全对齐。
 
 ---
 
@@ -410,6 +419,51 @@ ComfyUI-WINT8-XPU/
 
 ---
 
+## v5.1 同步更新 (2026-07-02)
+
+从 WINT4 v5.1 回移植以下修复：
+
+### Bug 修复
+
+| Bug | 修复 | 文件 |
+|------|------|------|
+| Conv2d 层 `kernel` 后缀不匹配 | `_load_from_state_dict` 加 kernel 回退，`weight` 找不到时尝试 `kernel` | `wint8_xpu_ops.py` |
+| Wan `motion_encoder` 被误量化 | 排除列表补全 | `wint8_model_quantizer.py` |
+| LTX2.3 `learnable_registers` / `q_norm` / `k_norm` 被误量化 | 排除列表补全 | `wint8_model_quantizer.py` |
+
+### 新增
+
+| 功能 | 说明 |
+|------|------|
+| Boogu gs=32 自动覆盖 | `model_type=="boogu"` 且启用 QuaRot 时自动将 group_size 强制为 32，QuaRot 覆盖率 27%→100% |
+
+---
+
+## 关于 ComfyUI 原生加载器
+
+ComfyUI 核心 `ops.py` 已内置 `int8_tensorwise` 量化格式支持（含 `convrot` QuaRot 协议）。**如果你的 ComfyUI 版本较新，可以直接用原生 `Load Diffusion Model` 节点加载 INT8 模型，无需使用本插件的 `WINT8 Model Loader`。**
+
+本插件仍然提供：
+- **WINT8 Model Quantizer** — 离线量化节点（原生不提供）
+- **WINT8 Model Loader** — 兼容旧版 ComfyUI（原生加载器不支持 INT8 时使用）
+
+> 建议：优先尝试原生 `Load Diffusion Model`；遇到兼容性问题再切回 `WINT8 Model Loader`。
+
+---
+
+## 关于性能
+
+本插件为 **纯 Python 实现**，无自定义 CUDA/SYCL kernel：
+
+- **推理速度** ≈ BF16/FP16，无体感差异（反量化仅为一次 broadcast 乘法）
+- **无额外加速** — 不包含 Triton/oneAPI/SYCL 加速路径（Intel XPU Triton 后端尚未成熟）
+- **适合 XPU 用户**（Intel Arc A770/B580）— ComfyUI 原生加载器在 XPU 上可正确加载 INT8 权重，本插件量化器产生兼容格式
+- 量化器输出格式与 ComfyUI 原生 `int8_tensorwise` 协议完全对齐，不绑定本插件
+
+> 如果你的硬件是 NVIDIA/CUDA，建议使用其他已集成了 CUDA kernel 的 INT8 方案（如 `bitsandbytes`、`torchao`）。本插件的优势在于 XPU 兼容性和格式与 ComfyUI 原生协议完全对齐。
+
+---
+
 ## License
 
 MIT © 2026 JWLHS
@@ -421,7 +475,3 @@ MIT © 2026 JWLHS
 - 仓库地址：https://github.com/JWLHS/ComfyUI-WINT8-XPU
 - 问题反馈：https://github.com/JWLHS/ComfyUI-WINT8-XPU/issues
 - ComfyUI：https://github.com/comfyanonymous/ComfyUI
-```
-
----
-
