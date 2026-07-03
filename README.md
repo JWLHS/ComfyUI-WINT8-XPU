@@ -1,477 +1,447 @@
-# WINT8 — Per-Row INT8 量化插件 for ComfyUI (Intel Arc XPU)
 
-> Per-row INT8 model quantization & loading for ComfyUI on Intel Arc A770 / B580.
+
+```markdown
+# ComfyUI-WINT4-XPU-beta
+
+> **INT4 per-row 模型量化 + LoRA 推理插件 — Intel Arc A770 16GB 优化，跨后端通用**
+
+将扩散模型量化为 per-row INT4 (packed uint8)，显存节省 75%，支持 10 种 LoRA 格式叠加。
+**Python 模式通用（XPU / CUDA / ROCm / CPU）。Triton 加速为 Intel XPU 专用。**
+
+---
+
+## 快速判断
+
+| 你是 | 建议 |
+|------|------|
+| Intel Arc A770/A750 用户 | 可选 Triton compile 加速（首次等 3-5min，后续同参数秒出） |
+| NVIDIA / AMD 用户 | 用 **python 模式**，零配置，开箱即用 |
+| 不想折腾 Triton | 用 **python 模式**，跟旧版完全一样，量化器照样用 |
+
+> **加速模式默认 python。** 除非你在 Intel Arc 上且已配好 PT 2.14 + oneAPI 2026.0，否则不要切换 compile/compile_freeze。
+>
+> **Triton 加速为 XPU 专用。** 其他显卡（NVIDIA / AMD / ROCm）若需 Triton 加速，请自行寻找适配自己硬件的方案。
 
 ---
 
 ## 目录
 
 1. [功能概览](#功能概览)
-2. [安装](#安装)
-3. [节点详解](#节点详解)
-   - [WINT8 Model Quantizer](#wint8-model-quantizer)
-   - [WINT8 Model Loader](#wint8-model-loader)
-4. [量化方法对比](#量化方法对比)
-5. [AIMDO DynamicVRAM 使用建议](#aimdo-dynamicvram-使用建议)
-6. [完整工作流](#完整工作流)
-7. [支持模型](#支持模型)
-8. [排除列表说明](#排除列表说明)
-9. [常见问题](#常见问题)
-10. [已验证效果](#已验证效果)
-11. [Bug 修复记录](#bug-修复记录)
-12. [文件结构](#文件结构)
-13. [v5.1 同步更新](#v51-同步更新-2026-07-02)
-14. [关于 ComfyUI 原生加载器](#关于-comfyui-原生加载器)
-15. [关于性能](#关于性能)
+2. [性能数据](#性能数据)
+3. [安装](#安装)
+4. [环境要求（Triton 加速）](#环境要求triton-加速仅-xpu)
+5. [启动配置（Triton XPU 必须）](#启动配置triton-xpu-加速必须)
+6. [加速模式详解](#加速模式详解)
+7. [节点详解](#节点详解)
+8. [快速开始](#快速开始)
+9. [支持的 LoRA 格式](#支持的-lora-格式)
+10. [支持的模型](#支持的模型)
+11. [从 PT 2.12 迁移](#从-pt-212-迁移到-pt-214)
+12. [已知限制](#已知限制)
+13. [常见问题](#常见问题)
+14. [v5 新增](#v5-新增)
+15. [v6 新增](#v6-新增)
+16. [Bug 修复记录](#bug-修复记录)
+17. [v6 踩坑记录 — Triton compile 加速](#v6-踩坑记录--triton-compile-加速200-次尝试历时-3-天)
+18. [文件清单](#文件清单)
+19. [相关链接](#相关链接)
+20. [鸣谢](#鸣谢)
 
 ---
 
 ## 功能概览
 
-将 **BF16 / FP16 / FP8** 扩散模型量化为 **per-row INT8**，实现：
+| 能力 | 状态 | 适用范围 |
+|------|:--:|------|
+| BF16/FP16/FP8/INT8 → INT4 量化 | ✅ | 通用 |
+| QuaRot (Hadamard 旋转) 质量提升 | ✅ INT4 必须开启 | 通用 |
+| INT4 UNet 推理 | ✅ | 通用 |
+| 单 LoRA 加载 | ✅ | 通用 |
+| 多 LoRA 叠加（串联 / Stack） | ✅ | 通用 |
+| LyCORIS LoKr 格式 | ✅ | 通用 |
+| ICLoRA / adaLN LoRA（bake-in） | ✅ | 通用 |
+| QKV 融合模型 LoRA | ✅ | 通用 |
+| 10 种 LoRA key 格式自动适配 | ✅ | 通用 |
+| AIMDO DynamicVRAM 双路径 | ✅ | 通用 |
+| Triton torch.compile 加速 | ✅ | **XPU 专用** |
 
-| 指标 | 效果 |
-|------|------|
-| **显存** | 节省 ~50%（vs BF16） |
-| **推理速度** | ≈ BF16 / FP16，无体感差异 |
-| **画质** | 正常，无花屏、无偏色 |
-| **加载** | < 2 秒（纯 tensor 赋值，无编译开销） |
-| **LoRA** | 支持（权重建议调高 1.5-2× 以补偿 INT8 精度损失） |
-| **AIMDO 兼容** | 兼容 DynamicVRAM，共享显存正常释放不泄漏 |
+---
 
-### 原理
+## 性能数据
 
-```
-量化阶段（离线）：             推理阶段（在线）：
+### 存储 & 显存（Krea2）
 
-weight_fp16 (out, in)         safetensors 加载
-    │                             │
-    ▼                             ▼
-amax = |w|.max(dim=1)         nn.Parameter(int8)  +  weight_scale(float32)
-scale = amax / 127               │
-w_int8 = round(w / scale)        ▼
-                            cast_bias_weight (AIMDO 搬到 XPU)
-保存：w_int8 + scale                │
-                                ▼
-                            反量化：w_fp = w_int8.float() × scale
-                                │
-                                ▼
-                            F.linear(x, w_fp, bias)
-                                │
-                                ▼
-                            uncast_bias_weight (AIMDO 搬回 CPU)
-```
+| 指标 | BF16 | INT8 | INT4 |
+|------|:--:|:--:|:--:|
+| UNet 存储 | 24 GB | 12 GB | **6 GB** |
+| 推理显存 | ~24 GB | ~16-17 GB | **~8-9 GB** |
+| A770 16GB 裸跑 | ❌ | ❌ | ✅ |
 
-每行权重独立计算 scale，反量化仅一次 broadcast 乘法，无额外内存开销。
+### Triton 加速（Arc A770, Boogu INT4, 8 steps）
+
+| 模式 | 首次 | 同参数第二次 | 改分辨率后 |
+|------|------|------|------|
+| python | ~180s | ~180s | ~180s |
+| compile | ~300s（含编译） | **~50s（3.6x）** | ~330s（重编译） |
+| compile_freeze | ~300s | **~45s（4.0x）** | ~330s |
+
+> **python 模式跨后端通用，所有显卡都能用。compile 仅在 Intel Arc + PT 2.14 + oneAPI 2026.0 上可用。**
 
 ---
 
 ## 安装
 
-### 方法一：git clone（推荐）
-
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/JWLHS/ComfyUI-WINT8-XPU.git
+git clone https://github.com/JWLHS/ComfyUI-WINT4-XPU-beta.git
 ```
 
-### 方法二：手动下载
+依赖同 INT8 插件，ComfyUI 启动时自动安装。
 
-1. 打开 https://github.com/JWLHS/ComfyUI-WINT8-XPU
-2. 点击绿色 **"Code"** → **"Download ZIP"**
-3. 解压到 `ComfyUI/custom_nodes/ComfyUI-WINT8-XPU/`
+---
 
-### 依赖
+## 环境要求（Triton 加速，仅 XPU）
 
-`requirements.txt` 中已声明，ComfyUI 启动时自动安装：
+以下仅针对 **Intel Arc 显卡 + 开启 compile/compile_freeze 模式**。python 模式无需关注。
+
+| 组件 | 版本 | 说明 |
+|------|------|------|
+| PyTorch | **2.14.0.dev+xpu** 以上 | nightly 版本，sycl9 运行时 |
+| Triton | 3.7.2（随 PyTorch 安装） | |
+| oneAPI | **2026.0** | ⚠️ 2025.3 存在 IGC 寄存器溢出 bug |
+| LevelZero SDK | 1.28.2+ | |
+| Python | 3.11+ | |
+
+---
+
+## 启动配置（Triton XPU 加速必须）
+
+### 方式 A：绘世启动器（推荐）
+
+在 `ComfyUI\.ext\Lib\site-packages\` 下新建两个文件：
+
+**`wint4_env.pth`**
+```
+import wint4_env_setup
+```
+
+**`wint4_env_setup.py`**
+```python
+import os
+
+_ONEAPI_BIN = r"C:\Program Files (x86)\Intel\oneAPI\compiler\2026.0\bin"
+_ONEAPI_LIB = r"C:\Program Files (x86)\Intel\oneAPI\compiler\2026.0\lib"
+
+_path = os.environ.get("PATH", "")
+if _ONEAPI_BIN not in _path:
+    os.environ["PATH"] = f"{_ONEAPI_BIN};{_ONEAPI_LIB};{_path}"
+
+os.environ.setdefault("IGC_largeGRF", "1")
+os.environ.setdefault("SYCL_ENABLE_DEFAULT_CONTEXTS", "1")
+os.environ.setdefault("PYTORCH_ENABLE_XPU_FALLBACK", "1")
+```
+
+> 替换 `2026.0` 为你的实际 oneAPI 版本号。
+
+### 方式 B：BAT 启动脚本（仅供参考）
+
+```bat
+@echo off
+:: ── Triton 启用必要项（仅供参考，根据实际路径调整）：───────────
+:: ① vcvarsall — 提供 MSVC 编译器
+:: ② oneAPI 2026.0 PATH — icpx.exe 必须能在 PATH 中找到
+:: ③ IGC_largeGRF=1 — 大寄存器文件
+:: ④ SYCL_ENABLE_DEFAULT_CONTEXTS=1 — Level Zero 上下文
+:: ⑤ PYTORCH_ENABLE_XPU_FALLBACK=1 — XPU 回退
+:: ──────────────────────────────────────────────────────────────
+
+call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
+
+set "PATH=C:\Program Files (x86)\Intel\oneAPI\compiler\2026.0\bin;C:\Program Files (x86)\Intel\oneAPI\compiler\2026.0\lib;%PATH%"
+set "IGC_largeGRF=1"
+set "SYCL_ENABLE_DEFAULT_CONTEXTS=1"
+set "PYTORCH_ENABLE_XPU_FALLBACK=1"
+
+cd /d E:\ComfyUI
+E:\ComfyUI\.ext\python.exe main.py --port 8189
+```
+
+---
+
+## 加速模式详解
+
+| 模式 | 速度 | 首次编译 | 改分辨率 | LoRA | 适用场景 | 适用范围 |
+|------|:--:|:--:|:--:|:--:|------|------|
+| **python** | 基准 | 0 | 无影响 | ✅ | 日常出图，终极兼容 | **通用** |
+| **compile** | +20-40% | 3-5 min | 需重编译 | ✅ | 同参数批量、seedvr2 放大 | **XPU 专用** |
+| **compile_freeze** | +30-50% | 3-5 min | 需重编译 | ❌ | 同参数批量，不换 LoRA | **XPU 专用** |
+
+### 工作原理（compile 模式）
 
 ```
-convert-to-quant    # ctq CLI（可选——不装也能用内置量化）
-safetensors         # 模型文件读写
-```
+首次 forward:
+    inductor trace 模型图（30-60s）
+        │
+        ▼
+    IGC 编译 Triton kernel（200-250s）  ← 只用一次
+        │
+        ▼
+    缓存持久化 → %USERPROFILE%\.triton\cache\
 
-> **注意：** `convert-to-quant` 是可选的。如果未安装，插件自动 fallback 到内置量化，功能完全正常。
+后续同参数 forward:
+    缓存命中 → 跳过 IGC 编译 → 秒进
+```
 
 ---
 
 ## 节点详解
 
----
+### WINT4 Model Quantizer
 
-### WINT8 Model Quantizer
+**功能：** BF16/FP16/FP8/INT8 → INT4 packed uint8 + QuaRot
 
-**位置：** `WINT8` 类别 → `WINT8 Model Quantizer`
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `model_name` | — | 选择源模型 |
+| `model_type` | `flux2` | 模型架构，控制排除列表 |
+| `enable_quarot` | `False` | **INT4 必须开启**，Hadamard 旋转 |
+| `group_size` | 128 | QuaRot 分组大小（Boogu 自动 32） |
+| `device` | `xpu` | 量化计算设备 |
+| `output_filename` | `model_int4` | 保存至 `output/`，支持子目录 |
 
-**功能：** 将 BF16/FP16/FP8 模型量化为 per-row INT8，输出 `.safetensors` 文件。
+### WINT4 Model Loader
 
-#### 参数
+**功能：** 加载 INT4 模型，可选加速模式
 
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|:---:|------|
-| `model_name` | 下拉 | — | 选择 `models/diffusion_models/` 下的模型 |
-| `model_type` | 下拉 | `flux2` | 模型架构，控制排除列表 |
-| `quant_method` | 下拉 | `auto` | 量化方法：`auto` / `ctq` / `builtin` |
-| `enable_quarot` | 开关 | `False` | Hadamard 正交旋转，提升质量（仅 `builtin`） |
-| `group_size` | 整数 | `128` | QuaRot 分组大小，64-256，步长 64 |
-| `device` | 下拉 | `xpu` | 量化计算设备 |
-| `output_filename` | 文本 | `model_int8` | 输出文件名，保存至 `ComfyUI/output/` |
+| 参数 | 默认值 | 说明 |
+|------|:---:|------|
+| `unet_name` | — | 选择量化后的模型 |
+| `model_type` | `flux2` | **必须和量化时一致** |
+| `acceleration_mode` | `python` | python / compile / compile_freeze |
 
-#### `quant_method` 详解
+### WINT4 LoRA Loader / LoRA Stack
 
-| 选项 | 行为 | 适用场景 |
-|------|------|------|
-| **`auto`** | 优先调用 ctq → ctq 失败自动 fallback 到内置量化 | 日常使用，最省心 |
-| **`ctq`** | 强制使用 ctq → 失败直接报错 | 需要 learned rounding 时 |
-| **`builtin`** | 直接用内置 per-row INT8，**可配合 QuaRot** | ctq 报错时，或需要 QuaRot 时 |
-
-#### `enable_quarot`（QuaRot / ConvRot）
-
-勾选后对每组权重应用 Hadamard 正交旋转：
-
-- **原理：** 浮点 outlier 被均匀分散到整行 → 量化误差更小 → 细节保留更好
-- **仅在 `builtin` 模式下生效**（ctq 模式由 ctq 自己的 `--convrot` 控制）
-- `group_size` 必须是 **2 的幂**，且需整除权重的 `in_features`
-- 量化时旋转权重（离线），推理时旋转激活（在线）— 两处由插件自动处理
-- **Boogu 自动覆盖：** `model_type=="boogu"` 时自动强制 `group_size=32`，覆盖率 27%→100%
-
-#### 量化速度参考（A770 XPU）
-
-| 模型 | 大小 (BF16) | 量化耗时 |
-|------|:---:|:---:|
-| Krea2 (12B) | ~24 GB | ~2-3 分钟 |
-| Flux2-Klein (9B) | ~18 GB | ~1.5-2 分钟 |
-| Qwen (7B) | ~14 GB | ~1 分钟 |
-
-#### FP8 → INT8 转换
-
-如果输入模型是 FP8（`Float8_e4m3fn`），内置量化会自动转为 float32 再量化，输出 INT8。文件体积变化极小（仅增加 per-row scale，约 0.1%）。目的不是省体积，而是用 per-row scale 替代 FP8 的全局 scale 提升质量。
+单 LoRA 链式串联 / 多 LoRA 一次叠加（最多 5 个）。compile 模式下已适配 `_orig_mod` 穿透，LoRA 不受影响。
 
 ---
 
-### WINT8 Model Loader
-
-**位置：** `WINT8` 类别 → `WINT8 Model Loader`
-
-**功能：** 加载量化后的 INT8 模型，输出 `MODEL` 直接接入采样流程。
-
-#### 参数
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|:---:|------|
-| `unet_name` | 下拉 | — | 选择量化后的 `.safetensors` 文件 |
-| `model_type` | 下拉 | `flux2` | **必须和量化时一致** |
-
-#### 内部推理流程
+## 快速开始
 
 ```
-加载 safetensors
-    │
-    ▼
-Int8XPUOps.Linear._load_from_state_dict:
-    - INT8 权重  → nn.Parameter（AIMDO 可见，支持延迟加载）
-    - weight_scale → register_buffer
-    - 解析元数据（QuaRot 标记 / group_size）
-    │
-    ▼
-推理 forward（逐层）:
-    cast_bias_weight(self, x)          ← AIMDO 把 weight/bias 从 CPU 搬到 XPU
-        │
-        ▼
-    weight_scale 对齐到 x.device
-        │
-        ▼
-    反量化: w_dq = weight.float() × w_scale  → comp_dtype
-        │
-        ▼
-    (可选) QuaRot 旋转激活
-        │
-        ▼
-    F.linear(x, w_dq, b_dq)
-        │
-        ▼
-    uncast_bias_weight(...)            ← AIMDO 把 weight/bias 搬回 CPU + 释放显存
+1. 量化:
+   WINT4ModelQuantizer
+   ├─ model_name      = BF16/FP16 模型
+   ├─ model_type      = krea2 / wan / ltx2 / flux2 / ...
+   ├─ enable_quarot   = True  ← INT4 必须开启
+   ├─ group_size      = 64（Boogu 自动 32）
+   ├─ device          = xpu
+   └─ output_filename = my_model_int4
+
+2. 推理（无 LoRA）:
+   WINT4ModelLoader → MODEL → KSampler → VAE Decode
+
+3. 推理（单 LoRA）:
+   WINT4ModelLoader → WINT4LoRALoader → KSampler
+
+4. 推理（多 LoRA 串联）:
+   WINT4ModelLoader → LoRA Loader (A) → LoRA Loader (B) → ...
+
+5. 推理（多 LoRA Stack）:
+   WINT4ModelLoader → WINT4LoRAStack（最多 5 槽）→ KSampler
 ```
 
-> **和 BF16 原生路径完全对称** — 只是中间多了反量化 + 可选 QuaRot。
+LoRA 强度建议 **1.5-2.0x**（INT4 精度限制）。ICLoRA / adaLN LoRA 自动 bake-in。
 
 ---
 
-## 量化方法对比
+## 支持的 LoRA 格式
 
-| | ctq | builtin | builtin + QuaRot |
-|---|---|---|---|
-| **格式** | per-row INT8 | per-row INT8 | per-row INT8 |
-| **舍入方式** | Learned rounding | 简单 round | 简单 round + Hadamard |
-| **质量** | 最高 | 良好 | 优秀 |
-| **依赖** | `convert-to-quant` | 无 | 无（scipy 可选） |
-| **模型兼容** | 部分模型有 bug（见 FAQ） | 全部 | 全部（需 in_f 整除 group_size） |
-| **推理速度** | 一致 | 一致 | 略有 overhead（Hadamard 旋转） |
-
-### 推荐
-
-| 场景 | 推荐配置 |
-|------|------|
-| ctq 可用且模型兼容 | `quant_method = auto` |
-| ctq 报错（如 Qwen FP8 相关） | `quant_method = builtin` |
-| 追求最高质量 | `quant_method = builtin` + `enable_quarot = True` |
+| # | 格式 | 示例 |
+|:-:|------|------|
+| ① | Kohya 标准 | `diffusion_model.blocks.0.attn.wq.lora_B.weight` |
+| ② | diffusers | `transformer.blocks.0.attn.to_q.lora_B.weight` |
+| ③ | SimpleTuner lycoris | `lycoris_blocks_0_attn_wq.lora_down.weight` |
+| ④ | bare | `blocks.0.attn.wq.lora_B.weight` |
+| ⑤ | onetrainer | `transformer.text_fusion.layerwise_blocks.0...` |
+| ⑥ | legacy ComfyUI | `lora_unet_blocks_0_attn_wq.lora_down.weight` |
+| ⑦ | onetrainer alt | `lora_transformer_blocks_0_attn_wq.lora_down.weight` |
+| ⑧ | BFL (Flux) | `single_blocks.0.attn.qkv.lora_A.weight` → 自动转换 |
+| ⑨ | LyCORIS LoKr | `diffusion_model.blocks.0.attn.wq.lokr_w1` |
+| ⑩ | LTX ICLoRA | `diffusion_model.adaln_single.*.lora_A.weight` → bake-in |
 
 ---
 
-## AIMDO DynamicVRAM 使用建议
+## 支持的模型
 
-### INT8 模型 — 推荐关 AIMDO
-
-**节点设置：** `XPU AIMDO Status` → `Enable_DynamicVRAM = OFF`
-
-| 模型 | 显存 (INT8) | A770 16GB 是否够 |
-|------|:---:|:---:|
-| Krea2 (12B) 1080×1920 | ~12 GB | ✅ 够 |
-| Flux2-Klein (9B) | ~9 GB | ✅ 够 |
-| Qwen (7B) | ~7 GB | ✅ 够 |
-| Z-Image | ~10 GB | ✅ 够 |
-
-> **INT8 模型显存已减半，大多数情况 16GB A770 够用。关 AIMDO 可避免共享显存管理开销，推理速度略快。**
-
-### BF16 原版模型 — 必须开 AIMDO
-
-原版 BF16 模型（~24 GB）远超 16 GB 显存，必须开 DynamicVRAM 做延迟加载。
-
-### 如果 INT8 + AIMDO 同时开
-
-**完全兼容**（Bug #9 已修复）。forward 走完整的 `cast_bias_weight` → 反量化 → 计算 → `uncast_bias_weight` 闭环，共享显存用完立即释放，不累积、不泄漏。
+| model_type | 模型系列 | 验证 |
+|:---|------|:--:|
+| `flux2` | Flux2-Klein | ✅ |
+| `qwen` | Qwen-Rapid / Qwen-EDIT / Qwen-AIO | ✅ |
+| `z-image` | Z-Image | ✅ |
+| `wan` | Wan 2.1/2.2 / SCAIL2 / WANanimate / Bernini / WANremix | ✅ |
+| `ltx2` | LTX 2.3 | ✅ |
+| `krea2` | Krea2 Turbo / Raw | ✅ |
+| `boogu` | Boogu Base / Edit / Turbo（auto gs=32） | ✅ |
+| `hidream` | HiDream | ✅ |
+| `ernie` | ERNIE | ✅ |
+| `ideogram4` | Ideogram 4 | ✅ |
+| `chroma` | Chroma/Distillation | ✅ |
+| `auto` | 通用（不排除任何层） | ⚠️ 谨慎使用 |
 
 ---
 
-## 完整工作流
+## 从 PT 2.12 迁移到 PT 2.14
 
-### 第一步：量化模型
+```bat
+:: 1. 卸载旧版 sycl8
+E:\ComfyUI\.ext\python.exe -m pip uninstall -y torch torchaudio torchvision triton-xpu intel-sycl-rt intel-cmplr-lib-rt intel-cmplr-lib-ur intel-cmplr-lic-rt intel-opencl-rt intel-openmp intel-pti mkl tbb tcmlib umf dpcpp-cpp-rt onemkl-sycl-blas onemkl-sycl-dft onemkl-sycl-lapack onemkl-sycl-rng onemkl-sycl-sparse onemkl-license
 
+:: 2. 安装 PT 2.14 nightly
+E:\ComfyUI\.ext\python.exe -m pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/xpu
+
+:: 3. 安装 oneAPI 2026.0（从 Intel 官网下载）
+:: 4. 按上方「启动配置」操作
 ```
-┌─────────────────────────────────────┐
-│  WINT8 Model Quantizer              │
-│                                     │
-│  model_name      = 选择 BF16 模型   │
-│  model_type      = flux2 / qwen ... │
-│  quant_method    = builtin          │
-│  enable_quarot   = True（可选）     │
-│  group_size      = 128              │
-│  device          = xpu              │
-│  output_filename = my_model_int8    │
-│                                     │
-│  → 执行                             │
-└─────────────────────────────────────┘
-```
-
-输出：`ComfyUI/output/my_model_int8.safetensors`
-
-### 第二步：构建推理工作流
-
-```
-┌──────────────────────────┐
-│  WINT8 Model Loader      │
-│  unet_name  = 刚量化的文件│
-│  model_type = 和量化一致  │
-│              ↓ MODEL      │
-└──────────────────────────┘
-         │
-         ▼
-┌──────────────────────┐
-│  XPU AIMDO Status    │
-│  Enable_DynamicVRAM  │
-│  = OFF（推荐）       │
-└──────────────────────┘
-         │
-         ▼
-┌──────────────────────┐
-│  KSampler            │
-│  → VAE Decode        │
-│  → 出图              │
-└──────────────────────┘
-```
-
-### 第三步（可选）：连接 LoRA
-
-```
-WINT8 Model Loader → MODEL
-    │
-    ├──→ LoRA Loader → MODEL
-    │         │
-    └──→ KSampler ←──┘
-```
-
-> LoRA 生效，但信号偏弱（INT8 精度限制），建议将 LoRA 权重调至 **1.5-2.0×**。
 
 ---
 
-## 支持模型
+## 已知限制
 
-| model_type | 含义 | ctq 支持 |
-|:---|------|:---:|
-| `flux2` | Flux2-Klein 系列 | ✅ 原生 flag |
-| `qwen` | Qwen-Rapid 系列 | ✅ 原生 flag |
-| `z-image` | Z-Image 系列 | ✅ 原生 flag |
-| `wan` | Wan 视频模型 | ✅ 原生 flag |
-| `ltx2` | LTX2 视频模型 | ✅ 原生 flag |
-| `chroma` | Chroma/Distillation | ✅ 原生 flag |
-| `krea2` | Krea2 图像模型 | ✅ 正则排除 |
-| `boogu` | Boogu 系列 | ✅ 正则排除 |
-| `ernie` | ERNIE 系列 | ✅ 正则排除 |
-| `hidream` | HiDream 系列 | ✅ 正则排除 |
-| `ideogram4` | Ideogram 4 系列 | ✅ 正则排除 |
-| `auto` | 通用（不排除任何层） | ❌ 无 |
-
----
-
-## 排除列表说明
-
-以下类型的层保持原精度，不量化（和 `convert_to_quant` 行为一致）：
-
-| 层类型 | 示例 key | 原因 |
-|------|------|------|
-| 输入投影 | `img_in`, `txt_in` | 第一层对精度敏感 |
-| 输出投影 | `final_layer`, `proj_out`, `head` | 最后一层影响最终输出 |
-| 时间嵌入 | `time_in`, `t_embedder`, `time_projection` | 小参数，量化无益 |
-| Norm 层 | `adaLN`, `norm_out`, `norm_q`, `norm_k` | 非 2D 权重 |
-| 小 Embedding | `patch_embedding`, `text_embedding` | 参数量极小 |
-| 特殊注册层 | `learnable_registers`, `q_norm`, `k_norm` | 非标准 Linear，量化会坏 |
-| 视频编码器 | `motion_encoder` | 非 Transformer 层，保持原精度 |
+1. 首次 compile 需等 3-5 分钟（IGC 编译）
+2. 改分辨率触发重编译；提示词/步数/CFG/seed 不触发
+3. compile_freeze 不支持 LoRA
+4. Triton 加速仅测试 Intel Arc A770 16GB
+5. PT 2.14 为 nightly dev，正式版可能有 API 变化
 
 ---
 
 ## 常见问题
 
-### Q: ctq 量化 Qwen 模型时报错 `"sum_cpu" not implemented for 'Float8_e4m3fn'`？
+**不想用 Triton？**
+选 python 模式。量化器照样用，所有功能一应俱全。跟旧版一模一样。
 
-**A:** 这是 ctq 的 bug——它在 `--int8` 模式下对 Qwen 错误调用了 FP8 路径。解决方案：选择 `quant_method = builtin`。
+**NVIDIA/AMD 能用吗？**
+量化器和 python 推理模式通用。Triton compile 模式为 XPU 专用——本插件的 build hook 仅处理 Intel 路径。NVIDIA/AMD 显卡的 Triton 加速请自行寻找适配方案。
 
-### Q: 加载时看到 `[WARNING] Missing weight for layer model.lm_head`？
+**重启后要重新编译吗？**
+Triton kernel 缓存（`.triton\cache\`）跨 session 持久。Inductor 图需重 trace（几十秒），但比首次快得多。
 
-**A:** 正常。`lm_head` 是语言模型头，图像生成时不参与计算。忽略即可，不影响画质。
+**为什么改分辨率要重编译？**
+Inductor 为每个 input shape 生成特化 kernel。提示词、步数、CFG 不改变 tensor shape，所以不触发。
 
-### Q: 量化后文件体积和原模型一模一样？
-
-**A:** 检查日志中的 `Quantized:` 数字。如果为 0：源模型可能已是 INT8/FP8——`_should_quantize` 不匹配。确保源模型是 BF16/FP16/FP8，且 `model_type` 正确。
-
-### Q: INT8 模型 + AIMDO DynamicVRAM 共享显存一直涨？
-
-**A:** 请更新到最新版（Bug #9 已修复）。确保 `wint8_xpu_ops.py` 的 forward 中走的是 `cast_bias_weight` / `uncast_bias_weight` 完整闭环。
-
-### Q: QuaRot 勾上了但没有效果？
-
-**A:** QuaRot 仅在 `quant_method = builtin` 时生效。检查：
-1. `enable_quarot = True`
-2. `quant_method = builtin`
-3. 权重的 `in_features` 能被 `group_size` 整除
-
-### Q: 原生 Load Diffusion Model 能加载 INT8 模型吗？
-
-**A:** 新版 ComfyUI 可以。核心 `ops.py` 已内置 `int8_tensorwise` 格式支持（含 `convrot`/QuaRot 协议）。如果你的 ComfyUI 版本较新，**优先尝试原生加载器**。遇到兼容性问题再切回 `WINT8 Model Loader`。本插件的量化器产生的格式与原生协议完全对齐。
+**INT4 模型能用官方 Load Diffusion Model 加载吗？**
+可以。ComfyUI 新版支持 INT4 格式，本插件量化器输出与原生协议对齐。遇到兼容性问题再切回 WINT4ModelLoader。
 
 ---
 
-## 已验证效果
+## v5 新增
 
-| 测试项 | 配置 | 结果 |
-|------|------|------|
-| Krea2 INT8 1080×1920 显存 | A770 16GB | ~12 GB（vs BF16 ~24 GB） |
-| 推理速度 | 同上 | ≈ BF16，无体感差异 |
-| 画质 | 多个 prompt 对比 | 正常，无花屏/偏色 |
-| LoRA | 权重 2.0× | 生效 |
-| AIMDO DynamicVRAM | INT8 模型 | 共享显存正常释放，不累积 |
-| 多次推理 | 连续 3 轮 | 显存稳定，不泄漏 |
-| 加载速度 | safetensors → MODEL | < 2 秒 |
-| FP8 → INT8 转换 | builtin 模式 | 正常 |
+| 功能 | 说明 |
+|------|------|
+| LTX2.3 完整支持 | 排除列表补全 + metadata 保留 |
+| Wan 模型检测 fallback | `head.modulation` 缺失时从权重 shape 反推 config |
+| FP8 清理修复 | 仅删除已被量化的 FP8 权重，其余转 FP16 |
+| motion_encoder 保护 | Wan 排除列表加 `motion_encoder` |
+| ICLoRA bake-in | 非量化层 LoRA 直接融合到 weight |
+| Boogu group_size=32 | 自动覆盖，100% QuaRot 覆盖率 |
+| 源 metadata 保留 | 透传原始 `config`，正确识别模型版本 |
+
+## v6 新增
+
+| 功能 | 说明 |
+|------|------|
+| Triton torch.compile 加速 | 三种模式，首次编译后同参数 4x 加速 |
+| compile + LoRA 支持 | 穿透 OptimizedModule wrapper |
+| INT8 Triton 同步移植 | build hook + float32 强制 + 电感静默 |
+| oneAPI 2026.0 适配 | IGC 寄存器溢出修复 |
+| 绘世启动器兼容 | `.pth` 注入方案 |
+| 代码清理 | 删重复分支、死代码、DLL 诊断日志 |
 
 ---
 
 ## Bug 修复记录
 
-本插件历经 9 轮 bug 修复，已稳定：
-
-| # | Bug 现象 | 根因 | 修复方式 |
-|---|------|------|------|
-| 1 | 花屏 | 量化器 key 用下划线，加载器用点分隔找不到 scale | `rsplit(".weight", 1)[0]` + `.weight_scale` |
-| 2 | 精度/偏色 | 排除列表不完整 | 从 ctq `constants.py` 同步 |
-| 3 | 元数据不识别 | ctq 和加载器键名不同 | 双读 `group_size`/`block_size`、`convrot`/`quarot` |
-| 4 | 缺失 `input_scale` | ctq 块状格式需要但未写入 | 量化器写入；加载器消费不报错 |
-| 5 | unexpected key 警告 | `_build_qlinear` 子模块自动注册 | `object.__setattr__` 绕过 |
-| 6 | bias device mismatch | AIMDO 把 bias 移 CPU，forward 未搬回 | `.to(device=x.device, dtype=comp_dtype)` |
-| 7 | 循环导入 | loader 顶层 import 触发 ops 初始化 | import 移至方法内 |
-| 8 | ops 文件被 loader 覆盖 | 误把 loader 代码写入 ops | 恢复 `Int8XPUOps` 类 |
-| 9 | AIMDO 共享显存泄漏 | INT8 forward 绕过 `cast_bias_weight`/`uncast_bias_weight` | 走 AIMDO 完整闭环 |
+| # | Bug | 修复 | 版本 |
+|---|------|------|:--:|
+| 28 | 多 LoRA 链式只有最后一个生效 | 删 `_lora_needs_reset=True`；prune 机制 | v4 |
+| 29 | LoKr 格式匹配 0 层 | 解析 lokr_w1/w2；动态 Kronecker 展开 | v4 |
+| 30 | LoKr 预计算 delta 撑爆显存 | 改动态展开 | v4 |
+| 31 | 双采第一个 UNet 不卸载 | detach 清空 `_lora_entries` | v4 |
+| 32 | LoKr delta shape 不匹配 | `_compute` shape guard | v4 |
+| 33 | MPS 设备不支持 | 加 MPS 检测 | v4 |
+| 34 | FP8 清理误删排除层 | 改为按 weight_scale 判断 + 转 FP16 | v5 |
+| 35 | Wan 模型检测失败 | 5D patch_embedding fingerprint fallback | v5 |
+| 36 | motion_encoder 被量化 | wan 排除列表 + kernel 回退 | v5 |
+| 37 | LTX2.3 shape mismatch | 排除列表补全 + metadata 保留 | v5 |
+| 38 | Boogu QuaRot 仅 27% 覆盖 | 自动 group_size=32 | v5.1 |
+| 39 | ICLoRA adaLN 被跳过 | bake-in 到非量化层 | v5.1 |
 
 ---
 
-## 文件结构
+## v6 踩坑记录 — Triton compile 加速（200+ 次尝试，历时 3 天）
+
+| # | 问题 | 现象 | 根因 | 修复 |
+|---|------|------|------|------|
+| 40 | IGC 寄存器溢出 | `ZE_RESULT_ERROR_MODULE_BUILD_FAILURE`，200 次尝试全部失败 | PT 2.12 + IGC 2025.3 无法处理 inductor 融合 kernel（9 合 1），Arc 128 寄存器饱和 | 升级 PT 2.14 + IGC 2026.0 |
+| 41 | `tl.full` monkey-patch 崩溃 | `ValueError: Did you forget to add @triton.jit?` | Triton 3.7.2 AST visitor 要求原始函数签名，lambda 破坏了 `_semantic` | 删除 monkey-patch，仅靠字符串替换 |
+| 42 | `dynamic=True` IGC 溢出 | 同 #40 | dynamic kernel 更复杂 | 弃用，后续手写 kernel |
+| 43 | `max_fusion_size=1` 无效 | 改分辨率仍重编译 330s | inductor 缓存 key 含 input shape | 确认 inductor 设计如此 |
+| 44 | compile + LoRA 失效 | `0 layers matched` | `OptimizedModule` wrapper 隐藏了 `_is_quantized` | 加 `while hasattr(dm, '_orig_mod')` 穿透 |
+| 45 | 系统 Python 被 sycl8 污染 | venv 启动 `access violation` | 系统 Python site-packages 有 sycl8 全家桶 | 卸载 Intel 2025.3 |
+| 46 | oneAPI `latest` 指向 2025.3 | `icpx.exe` 路径错误 | 符号链接未更新 | `mklink /D latest 2026.0` |
+| 47 | 绘世启动器不传 PATH | `icpx.exe` 找不到 | 绘世 python 不从系统继承 PATH | build hook 硬编码 + `.pth` 注入 |
+| 48 | MSVC INCLUDE/LIB 污染 | icpx 继承 MSVC 头文件 | `vcvarsall.bat` 变量被 subprocess 继承 | `os.environ.pop/restore` |
+| 49 | `cpp_wrapper` 传 MSVC 参数 | `/nologo` `/O2` `/MD` 出现在 icpx 命令 | inductor 默认 C++ wrapper | `inductor_config.cpp_wrapper=False` |
+| 50 | float64 不支持 | `Double type not supported` | Arc A770 无 fp64 | `set_default_dtype(float32)` + 字符串替换 |
+| 51 | `sycl_functions.h` 找不到 | 头文件缺失 | COMPILATION_HELPER include_dirs 不全 | 补全 triton_inc 路径 |
+| 52 | 改提示词疑似重编译 | 326s vs 214s | 排查时发现 inductor trace 不跨 session | 确认：同进程内改提示词不触发，重启才 trace |
+
+---
+
+## 文件清单
 
 ```
-ComfyUI-WINT8-XPU/
-├── __init__.py                  # ComfyUI 节点注册
-├── wint8_model_quantizer.py     # 量化节点（auto / ctq / builtin + QuaRot）
-├── wint8_model_loader.py        # 加载节点
-├── wint8_xpu_ops.py             # 推理 ops（AIMDO 闭环 + per-row 反量化 + LoRA）
-├── wint8_quarot.py              # Hadamard 正交旋转（离线权重 + 在线激活）
-├── requirements.txt             # 依赖声明
-├── README.md                    # 本文档
-├── LICENSE                      # MIT License
+ComfyUI-WINT4-XPU-beta/
+├── __init__.py
+├── wint4_model_quantizer.py     # 量化器
+├── wint4_model_loader.py        # 加载器（含 Triton 加速）
+├── wint4_xpu_ops.py             # 推理 ops（含 oneAPI build hook）
+├── wint4_lora_loader.py         # 单 LoRA（含 compile 穿透）
+├── wint4_lora_stack.py          # 多 LoRA Stack
+├── wint4_lora_common.py         # key 归一化 + BFL 转换
+├── wint8_quarot.py              # Hadamard 旋转
+├── check_int4.py                # 模型诊断脚本
+├── requirements.txt
+├── README.md
+├── LICENSE
 └── .gitignore
 ```
 
 ---
 
-## v5.1 同步更新 (2026-07-02)
+## 相关链接
 
-从 WINT4 v5.1 回移植以下修复：
-
-### Bug 修复
-
-| Bug | 修复 | 文件 |
-|------|------|------|
-| Conv2d 层 `kernel` 后缀不匹配 | `_load_from_state_dict` 加 kernel 回退，`weight` 找不到时尝试 `kernel` | `wint8_xpu_ops.py` |
-| Wan `motion_encoder` 被误量化 | 排除列表补全 | `wint8_model_quantizer.py` |
-| LTX2.3 `learnable_registers` / `q_norm` / `k_norm` 被误量化 | 排除列表补全 | `wint8_model_quantizer.py` |
-
-### 新增
-
-| 功能 | 说明 |
-|------|------|
-| Boogu gs=32 自动覆盖 | `model_type=="boogu"` 且启用 QuaRot 时自动将 group_size 强制为 32，QuaRot 覆盖率 27%→100% |
+- **本插件**: https://github.com/JWLHS/ComfyUI-WINT4-XPU-beta
+- **INT8 插件**: https://github.com/JWLHS/ComfyUI-WINT8-XPU
+- **convert-to-quant**: https://github.com/newgrit1004/convert-to-quant
 
 ---
 
-## 关于 ComfyUI 原生加载器
+## 鸣谢
 
-ComfyUI 核心 `ops.py` 已内置 `int8_tensorwise` 量化格式支持（含 `convrot` QuaRot 协议）。**如果你的 ComfyUI 版本较新，可以直接用原生 `Load Diffusion Model` 节点加载 INT8 模型，无需使用本插件的 `WINT8 Model Loader`。**
+本插件全部由 **DeepSeek V4 Pro** 完成。
 
-本插件仍然提供：
-- **WINT8 Model Quantizer** — 离线量化节点（原生不提供）
-- **WINT8 Model Loader** — 兼容旧版 ComfyUI（原生加载器不支持 INT8 时使用）
-
-> 建议：优先尝试原生 `Load Diffusion Model`；遇到兼容性问题再切回 `WINT8 Model Loader`。
-
----
-
-## 关于性能
-
-本插件为 **纯 Python 实现**，无自定义 CUDA/SYCL kernel：
-
-- **推理速度** ≈ BF16/FP16，无体感差异（反量化仅为一次 broadcast 乘法）
-- **无额外加速** — 不包含 Triton/oneAPI/SYCL 加速路径（Intel XPU Triton 后端尚未成熟）
-- **适合 XPU 用户**（Intel Arc A770/B580）— ComfyUI 原生加载器在 XPU 上可正确加载 INT8 权重，本插件量化器产生兼容格式
-- 量化器输出格式与 ComfyUI 原生 `int8_tensorwise` 协议完全对齐，不绑定本插件
-
-> 如果你的硬件是 NVIDIA/CUDA，建议使用其他已集成了 CUDA kernel 的 INT8 方案（如 `bitsandbytes`、`torchao`）。本插件的优势在于 XPU 兼容性和格式与 ComfyUI 原生协议完全对齐。
+参考项目：
+- [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
+- [ComfyUI-WINT8-XPU](https://github.com/JWLHS/ComfyUI-WINT8-XPU)
+- [convert-to-quant (ctq)](https://github.com/newgrit1004/convert-to-quant)
+- [FLA - Flash Linear Attention](https://github.com/fla-org/flash-linear-attention)（Triton XPU 经验参考）
 
 ---
 
 ## License
 
-MIT © 2026 JWLHS
+MIT
+```
 
 ---
-
-## 相关链接
-
-- 仓库地址：https://github.com/JWLHS/ComfyUI-WINT8-XPU
-- 问题反馈：https://github.com/JWLHS/ComfyUI-WINT8-XPU/issues
-- ComfyUI：https://github.com/comfyanonymous/ComfyUI
