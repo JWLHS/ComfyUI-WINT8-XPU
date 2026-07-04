@@ -5,155 +5,237 @@ INT8 custom operations for Intel XPU (Arc A770).
 
 Pure per-row INT8 inference:
   - weight_scale: (out_features, 1) or (out_features,)
-  - dequant: w.float() * scale  (one broadcast multiply)
-  - simple broadcast + F.linear
+  - dequant: w.float() * scale
+  - F.linear
+
+LoRA: via _lora_entries dict {lora_name: [(A,B,multiplier[,start,end]), ...]}.
+A = down projection (rank, in_f), B = up projection (out_f, rank).
+Stored on XPU.  Forward computes delta = B @ A on-the-fly.
+
+LoKr: entry = ("lokr", w1, w2, multiplier, factor[, start, end]).
+Dynamic Kronecker expansion in forward pass.
 
 Triton kernel reserved for future Intel backend int8 dot support.
 """
-
-import os
 import json
+import locale
 import logging
-
+import os
+import shutil
+import subprocess
+import sys
+import sysconfig
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Float32 hard-enforce — Arc A770 has no fp64; inductor emits float64 by default.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+torch.set_default_dtype(torch.float32)
+torch.set_float32_matmul_precision('high')
+
+# --- torch factory overrides ---
+_orig_torch_zeros = torch.zeros
+_orig_torch_ones = torch.ones
+_orig_torch_empty = torch.empty
+
+def _wint8_zeros(*a, **kw):
+    kw.setdefault('dtype', torch.float32)
+    return _orig_torch_zeros(*a, **kw)
+
+def _wint8_ones(*a, **kw):
+    kw.setdefault('dtype', torch.float32)
+    return _orig_torch_ones(*a, **kw)
+
+def _wint8_empty(*a, **kw):
+    kw.setdefault('dtype', torch.float32)
+    return _orig_torch_empty(*a, **kw)
+
+torch.zeros = _wint8_zeros
+torch.ones = _wint8_ones
+torch.empty = _wint8_empty
+
+# triton.language.zeros / tl.full monkey-patches intentionally omitted —
+# they break Triton 3.7.x AST visitor.
+
+# --- inductor async_compile.triton: float64 → float32 in generated kernel source ---
+try:
+    from torch._inductor.async_compile import triton as _inductor_triton
+    _orig_ind_triton = _inductor_triton
+    import torch._inductor.async_compile as _ac
+    def _patched_triton(src, *a, **kw):
+        if isinstance(src, str):
+            src = src.replace('tl.float64', 'tl.float32')
+        return _orig_ind_triton(src, *a, **kw)
+    _ac.triton = _patched_triton
+except Exception:
+    pass
+
 
 log = logging.getLogger("WINT8-XPU")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Environment setup
+# Auto-configure oneAPI compiler and build hook for torch.compile / Triton
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_TRITON_AVAILABLE = False
 
+def _configure_oneapi_for_triton():
+    """Find oneAPI DPC++ compiler via PATH, patch COMPILATION_HELPER,
+    and install a build hook that forces all Triton kernel compilation
+    through icpx.exe.
+    """
+    icpx = shutil.which("icpx.exe")
+    if not icpx:
+        log.warning("[WINT8] icpx.exe not found in PATH — Triton compile disabled")
+        return None
 
-def _try_add_dll_search_paths():
-    candidates = []
-    try:
-        import folder_paths
-        base = folder_paths.base_path
-        if base:
-            candidates.append(os.path.join(base, ".ext", "Library", "bin"))
-    except Exception:
-        pass
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        rel = os.path.normpath(os.path.join(here, "..", "..", "..", ".ext", "Library", "bin"))
-        candidates.append(rel)
-    except Exception:
-        pass
-    for p in candidates:
-        if os.path.isdir(p):
+    bin_dir = os.path.dirname(icpx)
+    lib_dir = os.path.join(os.path.dirname(bin_dir), "lib")
+    inc_dir = os.path.join(os.path.dirname(bin_dir), "include")
+
+    if not os.path.isfile(icpx):
+        return None
+
+    if hasattr(os, "add_dll_directory"):
+        for d in (bin_dir, lib_dir):
             try:
-                os.add_dll_directory(p)
+                os.add_dll_directory(d)
             except Exception:
                 pass
 
+    _patch_compilation_helper(bin_dir, lib_dir, inc_dir)
+    _install_build_hook(icpx, lib_dir, inc_dir)
 
-def _find_oneapi_2025():
-    base = r"C:\Program Files (x86)\Intel\oneAPI\compiler"
-    if not os.path.isdir(base):
-        return None
-    versions = []
-    for e in os.listdir(base):
-        full = os.path.join(base, e)
-        if os.path.isdir(full) and e.startswith("2025."):
-            if os.path.isfile(os.path.join(full, "bin", "icpx.exe")):
-                versions.append(e)
-    versions.sort(reverse=True)
-    return os.path.join(base, versions[0]) if versions else None
+    log.info(f"[WINT8] oneAPI detected at {bin_dir}")
+    return icpx
 
 
-def _patch_compilation_helper():
-    global _TRITON_AVAILABLE
+def _patch_compilation_helper(bin_dir, lib_dir, inc_dir):
+    """Force Triton's COMPILATION_HELPER to use oneAPI paths."""
     try:
+        import triton
         from triton.backends.intel.driver import COMPILATION_HELPER
+
+        level_zero_dir = r"C:\Program Files\LevelZeroSDK\1.28.2"
+        triton_root = os.path.dirname(os.path.dirname(triton.__file__))
+        triton_inc = os.path.join(triton_root, "backends", "intel", "include")
+        triton_lib = os.path.join(triton_root, "backends", "intel", "lib")
+
+        COMPILATION_HELPER.include_dir = [
+            triton_inc,
+            os.path.join(inc_dir, "sycl"),
+            inc_dir,
+            os.path.join(level_zero_dir, "include"),
+        ]
+        COMPILATION_HELPER.library_dir = [
+            triton_lib,
+            lib_dir,
+            os.path.join(level_zero_dir, "lib"),
+        ]
+        try:
+            COMPILATION_HELPER.sycl_dir = [bin_dir]
+        except AttributeError:
+            pass
+
+        log.info("[WINT8] Triton COMPILATION_HELPER patched")
+    except Exception:
+        pass
+
+
+def _install_build_hook(icpx_path, lib_dir, inc_dir):
+    """Replace triton.runtime.build._build with our own implementation.
+
+    Hard-codes oneAPI paths, bypassing shutil.which() in child processes.
+    Also patches triton.backends.intel.driver._build (import capture).
+    """
+    _ze_lib = r"C:\Program Files\LevelZeroSDK\1.28.2\lib"
+    _ze_inc = r"C:\Program Files\LevelZeroSDK\1.28.2\include"
+
+    try:
+        import triton.runtime.build as build_mod
     except ImportError:
+        log.warning("[WINT8] triton.runtime.build not available — build hook skipped")
         return
-    oneapi_dir = _find_oneapi_2025()
-    if oneapi_dir is None:
+
+    if getattr(build_mod._build, '__wint8_hook__', False):
+        log.info("[WINT8] build hook already installed, skipping")
         return
-    level_zero_dir = r"C:\Program Files\LevelZeroSDK\1.28.2"
-    triton_dir = os.path.dirname(triton.__file__)
-    triton_inc = os.path.join(triton_dir, "backends", "intel", "include")
-    triton_lib = os.path.join(triton_dir, "backends", "intel", "lib")
-    COMPILATION_HELPER.include_dir = [
-        triton_inc,
-        os.path.join(oneapi_dir, "include"),
-        os.path.join(oneapi_dir, "include", "sycl"),
-        os.path.join(level_zero_dir, "include"),
-    ]
-    COMPILATION_HELPER.library_dir = [
-        triton_lib,
-        os.path.join(oneapi_dir, "lib"),
-        os.path.join(level_zero_dir, "lib"),
-    ]
-    icpx_bin = os.path.join(oneapi_dir, "bin")
-    if os.path.isdir(icpx_bin) and icpx_bin not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = icpx_bin + os.pathsep + os.environ.get("PATH", "")
-    log.info(f"WINT8-XPU: Triton compilation locked to {oneapi_dir}")
+
+    def _wint8_build(name, src, srcdir, library_dirs, include_dirs,
+                     libraries, ccflags=None):
+        if ccflags is None:
+            ccflags = []
+
+        suffix = sysconfig.get_config_var('EXT_SUFFIX')
+        so = os.path.join(srcdir, f'{name}{suffix}')
+
+        scheme = sysconfig.get_default_scheme()
+        if scheme == 'posix_local':
+            scheme = 'posix_prefix'
+        py_inc = sysconfig.get_paths(scheme=scheme)["include"]
+        inc_dirs = [srcdir, py_inc]
+        inc_dirs += list(include_dirs)
+        inc_dirs += [os.path.join(inc_dir, "sycl"), inc_dir, _ze_inc]
+
+        import triton as _triton_mod
+        _triton_inc = os.path.join(
+            os.path.dirname(_triton_mod.__file__),
+            "backends", "intel", "include")
+        if os.path.isdir(_triton_inc):
+            inc_dirs.append(_triton_inc)
+
+        py_lib = os.path.abspath(
+            os.path.join(sysconfig.get_paths(scheme=scheme)["stdlib"], "..", "libs")
+        )
+        lib_dirs = [lib_dir, _ze_lib, py_lib]
+        lib_dirs += list(library_dirs)
+
+        cmd = [icpx_path, src, "-O3", "-shared"]
+        cmd += [f"-I{d}" for d in inc_dirs]
+        cmd += [f"-L{d}" for d in lib_dirs]
+        cmd += [f"-l{lib}" for lib in libraries]
+        cmd += [
+            "-fsycl", "-fno-sycl-id-queries-fit-in-int",
+            "-Wno-deprecated-declarations",
+            "-DSYCL_DISABLE_FSYCL_SYCLHPP_WARNING",
+        ]
+        cmd += ccflags
+        for bad in ("-Wno-psabi", "/Zc:__cplusplus", "/std:c++17",
+                    "/nologo", "/O2", "/LD", "/wd4996", "/MD", "/EHsc",
+                    "/Fo", "/link", "/OUT:", "/IMPLIB:", "/PDB:",
+                    "/LIBPATH:", ".lib"):
+            cmd = [a for a in cmd if bad not in a]
+        cmd += ["-o", so]
+
+        _saved_include = os.environ.pop("INCLUDE", None)
+        _saved_lib = os.environ.pop("LIB", None)
+        try:
+            subprocess.run(cmd, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as e:
+            output = e.stdout.decode(
+                locale.getpreferredencoding()
+                if sys.platform == "win32" else ()
+            )
+            raise RuntimeError(output)
+        finally:
+            if _saved_include is not None:
+                os.environ["INCLUDE"] = _saved_include
+            if _saved_lib is not None:
+                os.environ["LIB"] = _saved_lib
+        return so
+
+    _wint8_build.__wint8_hook__ = True
+    build_mod._build = _wint8_build
+    import triton.backends.intel.driver as driver_mod
+    driver_mod._build = _wint8_build
+
+    log.info("[WINT8] build hook installed — all Triton compilations will use icpx.exe")
 
 
-_try_add_dll_search_paths()
-_patch_compilation_helper()
-
-try:
-    _TRITON_AVAILABLE = True
-    log.info("WINT8-XPU: Triton XPU available")
-except ImportError:
-    log.info("WINT8-XPU: Triton not available")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Triton kernel (reserved — Intel backend WIP for int8 dot)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-if _TRITON_AVAILABLE:
-
-    @triton.jit
-    def _w8a8_blockwise_gemm_kernel(
-        a_ptr, w_ptr, c_ptr,
-        a_scale_ptr, w_scale_ptr, bias_ptr,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_wk, stride_wn,
-        stride_cm, stride_cn,
-        BLOCK_SIZE: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-        BLOCK_K: tl.constexpr,
-        HAS_BIAS: tl.constexpr,
-    ):
-        pid = tl.program_id(0)
-        num_pid_n = tl.cdiv(N, BLOCK_N)
-        pid_m = pid // num_pid_n
-        pid_n = pid % num_pid_n
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        offs_k = tl.arange(0, BLOCK_K)
-        a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-        w_ptrs = w_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-        for k0 in range(0, K, BLOCK_K):
-            a = tl.load(a_ptrs, mask=(offs_k[None, :] < (K - k0)), other=0)
-            w = tl.load(w_ptrs, mask=(offs_k[:, None] < (K - k0)), other=0)
-            acc += tl.dot(a, w)
-            a_ptrs += BLOCK_K * stride_ak
-            w_ptrs += BLOCK_K * stride_wk
-        c = acc.to(tl.float32)
-        k_blocks = K // BLOCK_SIZE
-        act_scale_offs = offs_m * k_blocks + (k_blocks - 1)
-        act_sc = tl.load(a_scale_ptr + act_scale_offs, mask=offs_m < M, other=1.0)
-        scale_n_idx = offs_n // BLOCK_SIZE
-        w_scale_ptrs = w_scale_ptr + (offs_m // BLOCK_SIZE)[:, None] * (N // BLOCK_SIZE) + scale_n_idx[None, :]
-        w_sc = tl.load(w_scale_ptrs, mask=(offs_m < M) & (offs_n < N), other=1.0)
-        c = c * act_sc[:, None] * w_sc
-        if HAS_BIAS:
-            c = c + tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)[None, :]
-        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-        tl.store(c_ptrs, c, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+_TRITON_COMPILER = _configure_oneapi_for_triton()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -289,9 +371,52 @@ if _COMFY_OPS:
                 else:
                     w_dq = (weight.float() * w_scale).to(comp_dtype)
 
+                # ── LoRA injection ────────────────────────────────
+                lora_entries = getattr(self, '_lora_entries', None)
+                if lora_entries is not None:
+                    for entries_list in lora_entries.values():
+                        for entry in entries_list:
+                            if isinstance(entry[0], str) and entry[0] == "lokr":
+                                _, w1, w2, multiplier, factor = entry[:5]
+                                sl_start = entry[5] if len(entry) > 5 else None
+                                sl_end   = entry[6] if len(entry) > 6 else None
+
+                                out_f_w2, in_f_w2 = w2.shape
+                                w1_d = w1.to(device=w_dq.device, dtype=comp_dtype)
+                                w2_d = w2.to(device=w_dq.device, dtype=comp_dtype)
+                                w1_exp = w1_d.repeat_interleave(out_f_w2 // factor, dim=0).repeat_interleave(in_f_w2 // factor, dim=1)
+                                delta = (w1_exp * w2_d).mul_(multiplier)
+
+                                if delta.shape[0] != w_dq.shape[0] or delta.shape[1] != w_dq.shape[1]:
+                                    continue
+                                if sl_start is not None:
+                                    w_dq[sl_start:sl_end, :].add_(delta)
+                                else:
+                                    w_dq.add_(delta)
+                                continue
+
+                            A, B, multiplier = entry[:3]
+                            sl_start = entry[3] if len(entry) > 3 else None
+                            sl_end   = entry[4] if len(entry) > 4 else None
+
+                            if A.shape[1] != w_dq.shape[1]:
+                                continue
+
+                            A_d = A.to(dtype=comp_dtype) if A.dtype != comp_dtype else A
+                            B_d = B.to(dtype=comp_dtype) if B.dtype != comp_dtype else B
+                            if A_d.device != w_dq.device:
+                                A_d = A_d.to(device=w_dq.device)
+                            if B_d.device != w_dq.device:
+                                B_d = B_d.to(device=w_dq.device)
+
+                            delta = (B_d @ A_d).mul_(multiplier)
+                            if sl_start is not None:
+                                w_dq[sl_start:sl_end, :].add_(delta)
+                            else:
+                                w_dq.add_(delta)
+
                 b_dq = bias.to(device=x.device, dtype=comp_dtype) if bias is not None else None
 
-                # ── LoRA (optional) ────────────────────────────────
                 if need_cast:
                     for fn in getattr(self, 'weight_function', []):
                         w_dq = fn(w_dq)
