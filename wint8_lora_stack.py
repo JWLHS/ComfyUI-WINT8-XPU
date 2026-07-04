@@ -24,6 +24,11 @@ class WINT8LoRAStack:
             inputs["optional"][f"strength_{i}"] = ("FLOAT", {"default": 1.0, "min": -100.0, "max": 100.0, "step": 0.01})
         return inputs
 
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):              # ← 新增
+        import random                                     # ← 新增
+        return random.random()                            # ← 新增
+
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "apply"

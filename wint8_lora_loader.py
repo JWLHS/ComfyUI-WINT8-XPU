@@ -24,6 +24,11 @@ class WINT8LoRALoader:
 			},
 		}
 
+	@classmethod
+	def IS_CHANGED(cls, model, lora_name, strength):    # ← 新增
+		import random                                     # ← 新增
+		return random.random()                            # ← 新增
+
 	RETURN_TYPES = ("MODEL",)
 	RETURN_NAMES = ("model",)
 	FUNCTION = "load_lora"

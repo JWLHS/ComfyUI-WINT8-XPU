@@ -135,6 +135,7 @@ class WINT8ModelLoader:
                 if bake_state is not None and '_orig_weight' in bake_state:
                     module.weight.data.copy_(bake_state['_orig_weight'])
                 object.__setattr__(module, '_wint8_bake_state', None)
+            object.__setattr__(model.model, '_lora_needs_reset', True)  # ← 新增
             return _orig_detach(unpatch_all)
         object.__setattr__(model, 'detach', _detach_with_cleanup)
 
