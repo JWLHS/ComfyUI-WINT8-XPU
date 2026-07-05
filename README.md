@@ -1,6 +1,8 @@
 
 
 ```markdown
+
+抱歉，这是上传错误，但是最近我在研究新改动，无暇顾及，总是这是python实现int8方式的一种，原理和以下int4几乎一样。
 # ComfyUI-WINT4-XPU-beta
 
 > **INT4 per-row 模型量化 + LoRA 推理插件 — Intel Arc A770 16GB 优化，跨后端通用**
