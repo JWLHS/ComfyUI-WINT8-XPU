@@ -10,6 +10,9 @@
 #    注意！因添加triton功能，现在wint8 model loder节点已经无法使用官方默认lora加载节点
 #        可选路径： wint8 model loder --- wint8 lora loder
 #        或者选择：官方默认unet节点---官方默认加载lora  官方节点依然能够识别wint8量化节点量化的模型！
+#  wint8:预量化模型，并非最佳参数，仅为测试时使用。
+#  链接: https://pan.baidu.com/s/1X7HzxlO1Bmq6hQKl8YAVMw?pwd=x2k2 提取码: x2k2 
+
 ---
 
 ## 快速判断
